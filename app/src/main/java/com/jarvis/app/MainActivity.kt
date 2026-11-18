@@ -3,14 +3,21 @@ package com.jarvis.app
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ContentValues
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.text.InputType
 import android.view.Gravity
@@ -21,6 +28,7 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
@@ -47,6 +55,7 @@ class MainActivity : Activity() {
     private var awakeUntil = 0L
     private var bubble: TextView? = null
     private var note = ""
+    private var camUri: Uri? = null
 
     private val modelUrlGemma = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it.litertlm"
     private val modelUrlSmall = "https://huggingface.co/litert-community/Qwen3-0.6B/resolve/main/Qwen3-0.6B.litertlm"
@@ -127,6 +136,8 @@ class MainActivity : Activity() {
         }
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row.addView(input, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(button("📷") { takePhoto() })
+        row.addView(button("🖼") { pickImage() })
         row.addView(button("Send") { sendInput() })
         root.addView(row)
 
@@ -186,12 +197,13 @@ class MainActivity : Activity() {
         send(t)
     }
 
-    private fun send(text: String) {
+    private fun send(text: String, imagePath: String? = null) {
         if (text.isBlank()) return
         if (!brain.ready) { addMsg("The model isn't loaded yet. Open ⚙ Settings to download one.", false); return }
         if (brain.busy) return
         confirmBar.visibility = View.GONE
         speaker.stop()
+        if (imagePath != null) addImage(imagePath)
         addMsg(text, true)
         bubble = addMsg("", false)
         brain.chat(text, object : Callbacks {
@@ -213,7 +225,7 @@ class MainActivity : Activity() {
                     awakeUntil = System.currentTimeMillis() + 12000
                 }
             }
-        })
+        }, imagePath)
     }
 
     // ---------------- voice ----------------
@@ -268,8 +280,69 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    // ---------------- vision ----------------
+    private fun takePhoto() {
+        val cv = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "jarvis_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            if (Build.VERSION.SDK_INT >= 29) put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Jarvis")
+        }
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
+        if (uri == null) { addMsg("Could not prepare the camera.", false); return }
+        camUri = uri
+        try {
+            startActivityForResult(Intent(MediaStore.ACTION_IMAGE_CAPTURE).putExtra(MediaStore.EXTRA_OUTPUT, uri), 12)
+        } catch (e: Exception) { addMsg("No camera app available.", false) }
+    }
+
+    private fun pickImage() {
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).setType("image/*").addCategory(Intent.CATEGORY_OPENABLE), 13)
+    }
+
+    /** Decode (downscaled, rotated upright), save to cache, and ask the model about it. */
+    private fun handleImage(uri: Uri) {
+        if (!brain.ready) { addMsg("Load a model first (Settings).", false); return }
+        Thread {
+            try {
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                var s = 1
+                while (maxOf(bounds.outWidth, bounds.outHeight) / s > 1280) s *= 2
+                val bmp = contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = s }) }
+                    ?: throw RuntimeException("cannot read image")
+                val o = contentResolver.openInputStream(uri)?.use { ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1) } ?: 1
+                val deg = when (o) { 6 -> 90f; 3 -> 180f; 8 -> 270f; else -> 0f }
+                val out = if (deg == 0f) bmp else Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(deg) }, true)
+                cacheDir.listFiles { f -> f.name.startsWith("vision_") }?.forEach { it.delete() }
+                val f = File(cacheDir, "vision_${System.currentTimeMillis()}.jpg")
+                f.outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, 88, it) }
+                ui.post {
+                    val typed = input.text.toString().trim()
+                    input.setText("")
+                    send(if (typed.isNotEmpty()) typed else "Describe this image briefly. Read out any text you see.", f.path)
+                }
+            } catch (e: Exception) { ui.post { addMsg("Image error: ${e.message}", false) } }
+        }.start()
+    }
+
+    private fun addImage(path: String) {
+        val bmp = BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = 4 }) ?: return
+        val iv = ImageView(this).apply { setImageBitmap(bmp); adjustViewBounds = true }
+        val lp = LinearLayout.LayoutParams(dp(180), LinearLayout.LayoutParams.WRAP_CONTENT)
+        lp.gravity = Gravity.END
+        lp.setMargins(0, dp(4), 0, dp(4))
+        log.addView(iv, lp)
+    }
+
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
         super.onActivityResult(req, res, data)
+        if (req == 12) {
+            val u = camUri
+            if (res == RESULT_OK && u != null) handleImage(u)
+            else if (u != null) try { contentResolver.delete(u, null, null) } catch (e: Exception) { }
+            return
+        }
+        if (req == 13) { if (res == RESULT_OK) data?.data?.let { handleImage(it) }; return }
         if (res != RESULT_OK || data == null) return
         if (req == 10) {
             val uri = data.data ?: return

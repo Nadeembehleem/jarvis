@@ -4,7 +4,9 @@ import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
 import com.google.ai.edge.litertlm.Backend
+import com.google.ai.edge.litertlm.Content
 import com.google.ai.edge.litertlm.Contents
+import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
@@ -14,6 +16,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.io.File
@@ -49,6 +52,7 @@ class Brain(private val ctx: Context, private val tools: Tools, private val stor
     private var job: Job? = null
     @Volatile var ready = false
     @Volatile var busy = false
+    @Volatile var visionOk = false
     @Volatile var pending: Pair<String, JSONObject>? = null
     val modelFile: File get() = File(ctx.filesDir, "model.litertlm")
 
@@ -77,8 +81,19 @@ $TOOL_SPEC
                 conv?.close(); conv = null
                 engine?.close(); engine = null
                 val backend = if (prefs.getBoolean("gpu", false)) Backend.GPU() else Backend.CPU()
-                val e = Engine(EngineConfig(modelPath = modelFile.path, backend = backend, cacheDir = ctx.cacheDir.path))
-                e.initialize()
+                fun cfg(vision: Boolean) =
+                    if (vision) EngineConfig(modelPath = modelFile.path, backend = backend, visionBackend = Backend.CPU(), cacheDir = ctx.cacheDir.path)
+                    else EngineConfig(modelPath = modelFile.path, backend = backend, cacheDir = ctx.cacheDir.path)
+                var e = Engine(cfg(true))
+                try {
+                    e.initialize()
+                    visionOk = true
+                } catch (ex: Exception) {
+                    // text-only model: retry without the vision encoder
+                    visionOk = false
+                    e = Engine(cfg(false))
+                    e.initialize()
+                }
                 engine = e
                 newConversation()
                 ready = true
@@ -91,12 +106,12 @@ $TOOL_SPEC
 
     fun cancel() { scope.launch { try { conv?.cancelProcess() } catch (e: Exception) { } } }
 
-    fun close() { scope.launch { try { conv?.close(); engine?.close() } catch (e: Exception) { } } }
+    fun close() { scope.launch { try { if (busy) { conv?.cancelProcess(); delay(400) }; conv?.close(); engine?.close() } catch (e: Exception) { } } }
 
-    fun chat(text: String, cb: Callbacks) {
+    fun chat(text: String, cb: Callbacks, imagePath: String? = null) {
         job = scope.launch {
             busy = true
-            try { run(text, cb) }
+            try { run(text, cb, imagePath) }
             catch (e: CancellationException) { throw e }
             catch (e: Exception) { cb.token("\n[error: ${e.message}]") }
             finally { busy = false; cb.done() }
@@ -107,7 +122,11 @@ $TOOL_SPEC
 
     private fun emit(cb: Callbacks, s: String) { cb.token(s); cb.sentence(s) }
 
-    private suspend fun run(text: String, cb: Callbacks) {
+    private suspend fun run(text: String, cb: Callbacks, imagePath: String? = null) {
+        if (imagePath != null && !visionOk) {
+            emit(cb, "This model can't see images. Download Gemma 4 E2B in Settings.")
+            return
+        }
         val p = pending
         if (p != null) {
             pending = null
@@ -121,8 +140,10 @@ $TOOL_SPEC
         val now = SimpleDateFormat("EEE dd MMM yyyy HH:mm", Locale.getDefault()).format(Date())
         var msg = "[Now: $now]" + (if (mem.isNotEmpty()) " [Known about user: ${mem.joinToString("; ")}]" else "") + "\n" + text
         var hops = 0
+        var image = imagePath
         while (true) {
-            val full = stream(msg, cb)
+            val full = stream(msg, cb, image)
+            image = null
             val call = parseTool(full) ?: break
             if (hops++ >= 5) break
             cb.tool(call.first)
@@ -144,11 +165,12 @@ $TOOL_SPEC
         } catch (e: Exception) { null }
     }
 
-    private suspend fun stream(msg: String, cb: Callbacks): String {
+    private suspend fun stream(msg: String, cb: Callbacks, img: String? = null): String {
         val sb = StringBuilder()
         var spoken = 0
         var toolMode = false
-        conv!!.sendMessageAsync(msg).collect { m ->
+        val flow = if (img != null) conv!!.sendMessageAsync(Message.of(Content.ImageFile(img), Content.Text(msg))) else conv!!.sendMessageAsync(msg)
+        flow.collect { m ->
             val chunk = m.toString()
             sb.append(chunk)
             if (!toolMode && sb.toString().trimStart().startsWith("<")) toolMode = true
